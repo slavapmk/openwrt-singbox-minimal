@@ -37,9 +37,9 @@ return view.extend({
   function update() {
    return execute('status').then(function(text) {
     var s=JSON.parse(text);
-    var states={running:'работает',stopped:'остановлен',downloading:'скачивается бинарник',waiting:'ожидание повторной загрузки'};
+    var states={running:'работает',stopped:'остановлен',downloading:'скачивается бинарник',waiting:'ожидание повторной загрузки',preparing:'подготовка запуска',loading_rules:'загрузка списков',checking:'проверка конфигурации',error:'ошибка запуска'};
     status.textContent=(s.running ? 'Работает' : (states[s.state] || s.state)) +
-     ' · RAM: '+(Number(s.ram)/1024).toFixed(1)+' МиБ · '+(s.version || 'бинарник не загружен');
+     ' · RAM: '+(Number(s.ram)/1024).toFixed(1)+' МиБ · '+(s.version || 'бинарник не загружен') + (s.error ? ' · '+s.error : '');
     logs.value=s.log || 'Журнал пока пуст';
    }).catch(function(e) {status.textContent='Ошибка состояния: '+e.message;});
   }

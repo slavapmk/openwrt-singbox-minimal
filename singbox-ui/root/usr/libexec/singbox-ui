@@ -5,7 +5,7 @@ TMP=/tmp/singbox-ui
 BIN=/tmp/sing-box
 mkdir -p "$TMP/rules"
 chmod 700 "$TMP"
-fail() { echo "$*" >&2; logger -t singbox-ui "$*"; exit 1; }
+fail() { echo error > "$TMP/state"; printf '%s\n' "$*" > "$TMP/error"; echo "$*" >&2; logger -t singbox-ui "$*"; exit 1; }
 get_settings() {
  config_load singboxui
  config_get hash main sha256
@@ -51,6 +51,7 @@ download_binary() {
    mv "$TMP/binary.part" "$BIN"
    chmod 700 "$BIN"
    logger -t singbox-ui 'Binary SHA-256 OK'
+   echo preparing > "$TMP/state"
    return 0
   fi
   rm -f "$TMP/binary.part"
@@ -136,6 +137,7 @@ status() {
  json_init
  json_add_boolean running "$running"
  json_add_string state "$state"
+ json_add_string error "$(cat "$TMP/error" 2>/dev/null)"
  json_add_string version "$version"
  json_add_string ram "$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)"
  json_add_string log "$(logread | grep -E 'singbox-ui|sing-box' | tail -n 60)"
@@ -195,6 +197,9 @@ case "$1" in
   echo 'Списки загружены'
  ;;
  run)
+  echo preparing > "$TMP/state"
+  rm -f "$TMP/error"
+  trap 'rc=$?; if [ "$rc" != 0 ]; then echo error > "$TMP/state"; fi' EXIT
   get_settings
   downloader=
   trap 'if [ -n "$downloader" ]; then kill "$downloader" 2>/dev/null; wait "$downloader" 2>/dev/null; fi; echo stopped > "$TMP/state"; exit 0' INT TERM
@@ -204,7 +209,9 @@ case "$1" in
    logger -t singbox-ui "Waiting $retry seconds before download retry"
    sleep "$retry"
   done
+  echo loading_rules > "$TMP/state"
   assets 0
+  echo checking > "$TMP/state"
   if [ -f "$BASE/config.pending.json" ]; then
    if check_config "$BASE/config.pending.json"; then
     cp -p "$BASE/config.json" "$BASE/config.previous.json"
