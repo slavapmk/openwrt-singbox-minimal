@@ -1,0 +1,2 @@
+# Sourced by OpenWrt's LED service; do not replace its UCI context.
+/usr/libexec/singbox-ui-led refresh

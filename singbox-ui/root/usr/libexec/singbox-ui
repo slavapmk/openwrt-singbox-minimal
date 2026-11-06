@@ -140,11 +140,33 @@ status() {
  json_add_string error "$(cat "$TMP/error" 2>/dev/null)"
  json_add_string version "$version"
  json_add_string ram "$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)"
- json_add_string log "$(logread | grep -E 'singbox-ui|sing-box' | tail -n 60)"
+ # The marker lives in RAM like logd's ring buffer. If it has rotated out,
+ # all remaining records are newer and may be displayed.
+ json_add_string log "$(logread | awk -v marker="$(cat "$TMP/log-marker" 2>/dev/null)" '
+  /singbox-ui|sing-box/ {
+   if (marker != "" && index($0, marker)) { count=0; next }
+   line=$0; gsub(sprintf("%c",27) "\\[[0-9;]*m", "", line)
+   lines[++count]=line
+  }
+  END { start=count-59; if(start<1)start=1; for(i=start;i<=count;i++)print lines[i] }
+ ')"
  json_dump
 }
 case "$1" in
  status) status;;
+ clear-log)
+  marker="SBUI_LOG_CLEAR_$(date +%s)_$$"
+  logger -t singbox-ui "$marker"
+  # logger sends asynchronously: wait until logd exposes the boundary.
+  tries=0
+  while ! logread | grep -Fq "$marker"; do
+   tries=$((tries + 1))
+   [ "$tries" -lt 4 ] || { echo 'Не удалось установить границу журнала' >&2; exit 1; }
+   sleep 1
+  done
+  printf '%s\n' "$marker" > "$TMP/log-marker"
+  echo 'Старые записи скрыты. Новые события будут появляться в журнале.'
+ ;;
  routes-off) routes_off;;
  routes-on) get_settings; routes_on;;
  check) check_config "$BASE/config.pending.json";;

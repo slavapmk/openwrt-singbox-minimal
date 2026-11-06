@@ -19,7 +19,7 @@ function notify(error, text) {
  ui.addNotification(null, E('p', {}, text), error ? 'danger' : 'info');
 }
 function actionButton(label, action) {
- return E('button', {'class':'cbi-button cbi-button-action', 'click':ui.createHandlerFn(null, function() {
+ return E('button', {'type':'button', 'class':'cbi-button cbi-button-action', 'click':ui.createHandlerFn(null, function() {
   return execute(action).then(function(s) {notify(false,s);}).catch(function(e) {notify(true,e.message);});
  })}, label);
 }
@@ -34,13 +34,15 @@ return view.extend({
   this.map=m;
   var status=E('div', {'class':'cbi-section'}, 'Проверка состояния…');
   var logs=E('textarea', {'readonly':'', 'rows':12, 'style':'width:100%;font-family:monospace'}, '');
+  var logGeneration=0;
   function update() {
+   var generation=logGeneration;
    return execute('status').then(function(text) {
     var s=JSON.parse(text);
     var states={running:'работает',stopped:'остановлен',downloading:'скачивается бинарник',waiting:'ожидание повторной загрузки',preparing:'подготовка запуска',loading_rules:'загрузка списков',checking:'проверка конфигурации',error:'ошибка запуска'};
     status.textContent=(s.running ? 'Работает' : (states[s.state] || s.state)) +
      ' · RAM: '+(Number(s.ram)/1024).toFixed(1)+' МиБ · '+(s.version || 'бинарник не загружен') + (s.error ? ' · '+s.error : '');
-    logs.value=s.log || 'Журнал пока пуст';
+    if(generation===logGeneration) logs.value=s.log || 'Журнал пока пуст';
    }).catch(function(e) {status.textContent='Ошибка состояния: '+e.message;});
   }
   var s=m.section(form.NamedSection,'main','main');
@@ -80,12 +82,12 @@ return view.extend({
     if (file.size>262144) {notify(true,'Лимит JSON: 256 КиБ');return;}
     file.text().then(function(text) {JSON.parse(text); var n=editorNode();if(n){n.setValue(text);n.triggerValidation();}}).catch(function(e){notify(true,e.message);});
    }});
-   var save=E('button',{'class':'cbi-button','click':function(ev) {
+   var save=E('button',{'type':'button','class':'cbi-button','click':function(ev) {
     ev.preventDefault();
     var url=URL.createObjectURL(new Blob([value()],{type:'application/json'}));
     var a=E('a',{'href':url,'download':'sing-box-config.json'});a.click();setTimeout(function(){URL.revokeObjectURL(url);},1000);
    }},'Скачать JSON');
-   var check=E('button',{'class':'cbi-button','click':ui.createHandlerFn(null,function() {
+   var check=E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function() {
     try {JSON.parse(value());}catch(e){notify(true,e.message);return;}
     return fs.write('/etc/singbox-ui/config.pending.json',value()+'\n',384)
      .then(function(){return execute('check');}).then(function(){notify(false,'Проверка sing-box пройдена');}).catch(function(e){notify(true,e.message);});
@@ -123,7 +125,13 @@ return view.extend({
    return E('div',{},[status,E('div',{'class':'cbi-section'},[
     actionButton('Запустить','start'),actionButton('Остановить','stop'),actionButton('Перезапустить','restart')]),
     node,E('div',{'class':'cbi-section'},[actionButton('Загрузить сохранённые списки','assets')]),
-    E('h3',{},'Журнал'),logs]);
+    E('h3',{},'Журнал'),
+    E('p',{},'Последние 60 записей из кольцевого журнала OpenWrt в RAM. Уровень задаётся в JSON: log.level (warn, error, info, debug); log.disabled: true отключает журнал ядра.'),
+    E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function() {
+     logGeneration++;
+     return execute('clear-log').then(function(text){logGeneration++;logs.value='';notify(false,text);return update();})
+      .catch(function(e){notify(true,e.message);});
+    })},'Очистить окно журнала'),logs]);
   });
  },
  handleSave:null,
@@ -133,5 +141,5 @@ return view.extend({
    .then(function(text){notify(false,text);window.location.reload();})
    .catch(function(e){notify(true,e.message);});
  },
- handleReset:function(){return this.map.reset();}
+ handleReset:function(){notify(false,'Несохранённые изменения формы сброшены. Для журнала используйте «Очистить окно журнала».');return this.map.reset();}
 });

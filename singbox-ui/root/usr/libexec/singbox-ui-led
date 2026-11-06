@@ -1,0 +1,37 @@
+#!/bin/sh
+. /lib/functions.sh
+apply_led() {
+ local section="$1" trigger sysfs mode active=0 dir
+ config_get trigger "$section" trigger
+ [ "$trigger" = singbox-ui ] || return 0
+ config_get sysfs "$section" sysfs
+ case "$sysfs" in ''|*/*|*..*) return 0;; esac
+ dir="/sys/class/leds/$sysfs"
+ [ -w "$dir/brightness" ] || return 0
+ config_get mode "$section" singbox_state initializing
+ [ "$mode" != "$state" ] || active=1
+ echo none > "$dir/trigger"
+ if [ "$active" = 1 ]; then cat "$dir/max_brightness" > "$dir/brightness"
+ else echo 0 > "$dir/brightness"; fi
+}
+refresh() {
+ state=stopped
+ if [ "$1" != off ]; then
+  read -r state < /tmp/singbox-ui/state 2>/dev/null || state=stopped
+  case "$state" in
+   preparing|downloading|waiting|loading_rules|checking) state=initializing;;
+   running)
+    pid=
+    read -r pid < /tmp/singbox-ui/pid 2>/dev/null
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then state=error; fi
+   ;;
+  esac
+ fi
+ config_load system
+ config_foreach apply_led led
+}
+case "$1" in
+ monitor) trap 'refresh off; exit 0' TERM INT; while :; do refresh; sleep 2; done;;
+ off) refresh off;;
+ *) refresh;;
+esac
