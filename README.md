@@ -1,0 +1,260 @@
+# Минимальный sing-box + LuCI для OpenWrt
+
+Для Xiaomi Mi Router 4A Gigabit v2 / MT7621: 128 МБ RAM, мало свободной флеш-памяти. Бинарник загружается в `/tmp` после включения; настройки и JSON сохраняются во флеш-памяти. Прошивка не заменяется.
+
+Основа: **sing-box 1.14.4**, **Go 1.26.8**, `linux/mipsle`, `softfloat`, без CGO. Измеренный размер исходной сборки — **21,00 МиБ**. После короткого теста HY2/SNI на роутере оставалось около 14 МиБ RAM; это не гарантия работы с большими списками и большим числом клиентов.
+
+## Что включено
+
+- HY2, Direct, Selector и URLTest.
+- SOCKS5/HTTP Mixed, TPROXY и Redirect.
+- Sniffing TLS SNI, HTTP Host и QUIC; на роутере подтверждён TLS SNI.
+- Доменные/IP-правила, Reject, локальные и удалённые rule-set.
+- DNS UDP/TCP/DoT/DoH/Local.
+- LuCI: источники бинарника, SHA-256, JSON-редактор, запуск, параметры Go, файлы правил, журнал и перехват LAN.
+
+XHTTP, VLESS, TUN, Clash API и стандартный CLI в этой сборке не зарегистрированы. Поддерживаются команды `version`, `check -c FILE`, `run -c FILE`. Исходный код движка не меняется: вместо общего реестра подключается собственный `core/minimal-main.go`.
+
+## Структура
+
+```text
+core/                 минимальная точка входа и сборка Go
+singbox-ui/           LuCI, служба OpenWrt, установщик
+examples/config.json  конфиг с вымышленными серверами и паролями
+scripts/              общая сборка и упаковка
+tests/                проверка примеров и содержимого пакета
+.github/workflows/    сборка через GitHub Actions
+```
+
+## Сборка на Windows
+
+Нужны PowerShell, Python 3 и интернет. Go скачивается в папку проекта, системная установка не нужна.
+
+Из корня репозитория:
+
+```powershell
+.\scripts\build.ps1
+```
+
+Команда скачивает исходники фиксированной версии, собирает MIPSLE ELF и упаковывает LuCI. Результат:
+
+```text
+dist/sing-box-min-linux-mipsle
+dist/singbox-ui.tar.gz
+dist/SHA256SUMS
+```
+
+Основные параметры Go: `CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat`, тег `with_quic`, флаги `-trimpath -buildvcs=false -ldflags '-s -w -buildid= -checklinkname=0'`.
+
+`scripts/package.py` вычисляет SHA-256 **реально собранного файла** и подставляет его в настройки внутри архива. Нулевой SHA-256 в исходном шаблоне не предназначен для установки без упаковки.
+
+Для упаковки уже собранного MIPSLE-файла:
+
+```powershell
+python scripts/package.py --binary PATH_TO_BINARY
+python tests/validate.py
+```
+
+## Сборка на Linux / GitHub Actions
+
+Нужен Go 1.26.8 и Python 3. Из корня репозитория:
+
+```sh
+mkdir -p .upstream dist
+curl -fL https://codeload.github.com/SagerNet/sing-box/tar.gz/refs/tags/v1.14.4 \
+  | tar -xz --strip-components=1 -C .upstream
+mkdir -p .upstream/cmd/sing-box-min
+cp core/minimal-main.go .upstream/cmd/sing-box-min/main.go
+
+cd .upstream
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+  go build -trimpath -buildvcs=false -tags with_quic \
+  -ldflags '-s -w -buildid= -checklinkname=0' \
+  -o ../dist/sing-box-min-linux-mipsle ./cmd/sing-box-min
+cd ..
+python3 scripts/package.py --binary dist/sing-box-min-linux-mipsle
+python3 tests/validate.py
+```
+
+В GitHub Actions есть workflow **Build minimal sing-box and LuCI**: запускается при push/PR в `main` и вручную. Готовые файлы находятся в артефакте workflow. Workflow добавлен в репозиторий; его удалённый запуск здесь не проверялся.
+
+## Подготовка OpenWrt
+
+Целевая система тестирования: OpenWrt 25.12.6, firewall4/nftables, LuCI с rpcd-mod-file, пакетный менеджер apk. Для перехвата нужны:
+
+```sh
+apk update
+apk add kmod-nft-tproxy ip-full
+```
+
+Версия kmod должна соответствовать ядру. Не используйте принудительную установку несовместимых модулей. Для SNI-маршрутизации `dnsmasq-full` не требуется; ранее установленный можно оставить.
+
+## Установка LuCI
+
+Остановить ручной sing-box через Ctrl+C. Имеющийся `/tmp/sing-box` оставить: установщик использует его повторно, если SHA-256 подходит.
+
+На компьютере из корня репозитория:
+
+```powershell
+scp -O dist/sing-box-min-linux-mipsle root@192.168.1.1:/tmp/sing-box
+scp -O dist/singbox-ui.tar.gz root@192.168.1.1:/tmp/
+```
+
+Перед переносом бинарника на маломощный роутер остановить прежний клиент и освободить RAM от его старого временного файла. Не держать одновременно два больших исполняемых файла в `/tmp`.
+
+На роутере:
+
+```sh
+chmod 700 /tmp/sing-box
+tar -xzf /tmp/singbox-ui.tar.gz -C /tmp
+sh /tmp/singbox-ui/install.sh
+```
+
+Заново войти в LuCI: **Сеть → Sing-box**, при необходимости Ctrl+F5. Установщик сохраняет резервную копию и выводит команду отката. При переносе прежних экспериментов отключает службы `hy-vpn`/`hyroute` и убирает только их известные тестовые таблицы/правила. Настройки DoH сохраняются.
+
+В чистой установке конфиг содержит `CHANGE_ME` и адреса `203.0.113.10/20`. Укажите собственные реальные серверы. Если на роутере есть прежние тестовые JSON, установщик импортирует их; при повторной установке сохраняет конфигурацию новой страницы.
+
+## Источники бинарника
+
+Во вкладке **Бинарник** добавить несколько прямых HTTP/HTTPS-ссылок в нужном порядке:
+
+```text
+http://192.168.1.10/files/sing-box-min-linux-mipsle
+https://github.com/OWNER/REPO/releases/download/TAG/sing-box-min-linux-mipsle
+```
+
+Это ссылки на **распакованный ELF**, не на HTML, ZIP или GZIP. NAS должен отдавать файл по HTTP/HTTPS; SMB/UNC не монтируется. Все зеркала должны отдавать одинаковый файл.
+
+SHA-256 уже подставлен при упаковке; сверить можно с `dist/SHA256SUMS`. При ошибке загрузки или хеша пробуется следующий источник. Если не сработал ни один — повтор через настроенный интервал. **До перезагрузки роутера обязательно сохранить рабочие URL.**
+
+После перезагрузки бинарник загружается заново. При перезапуске службы подходящий файл в RAM используется повторно. Автообновления версии нет.
+
+## Серверы HY2
+
+Во вкладке **Конфигурация JSON** заменить адрес, порт, пароль и SNI:
+
+```json
+{
+  "type": "hysteria2",
+  "tag": "hy1",
+  "server": "vpn.example.com",
+  "server_port": 20001,
+  "password": "YOUR_PASSWORD",
+  "tls": {
+    "enabled": true,
+    "server_name": "vpn.example.com"
+  }
+}
+```
+
+Чтобы добавить сервер, добавить новый outbound с уникальным `tag`, затем включить его в `outbounds` группы `vpn`. Например:
+
+```json
+{
+  "type": "urltest",
+  "tag": "vpn",
+  "outbounds": ["hy1", "hy2", "hy3"],
+  "url": "https://www.gstatic.com/generate_204",
+  "interval": "1m"
+}
+```
+
+URLTest выбирает доступный выход по результатам проверок, а не строго по порядку серверов. При смене выхода текущие соединения могут оборваться. Для единственного сервера достаточно одного элемента в группе.
+
+## Те же правила: VPN / блокировка / напрямую
+
+В `route` правила проверяются по порядку. Sniffing должен идти **перед** доменными правилами; затем блокировка, затем VPN, в конце Direct:
+
+```json
+"route": {
+  "rules": [
+    {"action": "sniff", "sniffer": ["tls", "http", "quic"], "timeout": "1s"},
+    {"domain_suffix": ["blocked.example"], "action": "reject"},
+    {"domain_suffix": ["api.ipify.org", "vpn-only.example"], "outbound": "vpn"}
+  ],
+  "final": "direct"
+}
+```
+
+- **Белый список:** дополнять `domain_suffix` в правиле `outbound: vpn`.
+- **Чёрный список:** дополнять `domain_suffix` в правиле `action: reject`.
+- **Остальное:** `final: direct`.
+- `domain_suffix: ["example.com"]` включает сам домен и все его поддомены.
+- Только точное имя: `domain: ["example.com"]`.
+- Исключение для поддомена: правило `domain: ["direct.example.com"], outbound: direct` поставить до VPN-правила родительского домена.
+- IP/подсети: отдельное правило `ip_cidr: ["203.0.113.0/24"], outbound: vpn`.
+
+При пересечении белого и чёрного списков первое правило выигрывает; в примере блокировка выше VPN. Для точного исключения из блокировки поставить Direct-правило ещё выше неё.
+
+Это не DNS-наборы: ядро получает соединение, читает TLS SNI/HTTP Host/QUIC и принимает решение. DNS нужен устройствам для обычного определения IP, но не для наполнения таблицы VPN-доменов. **ECH скрывает настоящее имя; если определить домен нельзя и нет другого подходящего правила, сработает Direct.** Sniffing также не раскрывает все имена внутри переиспользуемого HTTP/2/3-соединения.
+
+Редактор не переписывает JSON автоматически. Кнопка **Проверить JSON** вызывает `check`; **Сохранить и применить** сохраняет предыдущий конфиг и перезапускает службу. Если бинарника ещё нет, проверка выполняется после загрузки до запуска. Откат JSON доступен отдельной кнопкой. Это не проверка работоспособности удалённых серверов.
+
+## Включение для всей LAN
+
+В JSON нужен вход:
+
+```json
+{"type": "tproxy", "tag": "transparent", "listen": "::", "listen_port": 2500}
+```
+
+Во вкладке **Перехват LAN** включить перехват, указать `br-lan` и порт `2500`, сохранить. В примере такой вход уже есть; импортированный старый JSON может его не содержать.
+
+Приложение использует nft-таблицу `inet sbui`, метку `0x200`, policy rule и таблицу маршрутизации `101`. Перехватываются TCP/UDP LAN, кроме локальных адресов и портов DNS 53/853. Правила доменов находятся в JSON; добавлять nftset для каждого сайта не нужно.
+
+До первого запуска ядра после включения маршрутизация остаётся прямой. При остановке службы перехват отключается. При аварии процесса правила сохраняются до его перезапуска. Автоматического гарантированного запрета утечек при любых сбоях эта версия не обещает.
+
+## Geo / SRS-списки
+
+Использовать небольшие rule-set `.srs` либо source JSON вместо старых `.dat`. Во вкладке файлов правил указать имя, URL и необязательный SHA-256; сохранить настройки. Файлы загружаются перед запуском, обновляются вручную кнопкой, хранятся в RAM. Лимит одного файла — 2 МиБ; больших наборов на этом роутере избегать. Расписания обновления пока нет.
+
+Для файла `selected.srs` в `route.rule_set` добавить:
+
+```json
+{"type": "local", "tag": "selected", "format": "binary", "path": "/tmp/singbox-ui/rules/selected.srs"}
+```
+
+В `route.rules` после sniffing и блокировки добавить:
+
+```json
+{"rule_set": ["selected"], "outbound": "vpn"}
+```
+
+Для JSON-набора использовать `format: source`. Само скачивание файла ещё не создаёт правило. Можно также задать remote rule-set непосредственно в JSON; интерфейс не ограничивает полный поддерживаемый формат конфигурации.
+
+## Проверка
+
+Без прозрачного перехвата, через SOCKS:
+
+```powershell
+curl.exe --proxy socks5://192.168.1.1:1080 --max-time 30 https://api.ipify.org
+```
+
+`socks5://` передаёт прокси IP, домен должен определиться по SNI. После включения перехвата:
+
+```powershell
+curl.exe --noproxy "*" -4 --max-time 30 https://api.ipify.org
+curl.exe --noproxy "*" -4 --max-time 30 https://ip.me
+```
+
+Первый запрос должен показать VPN-IP, второй — обычный внешний IP. В журнале проверить `sniffed protocol`, домен и выбранный выход. Для диагностики временно поставить `log.level: debug` в JSON.
+
+На роутере:
+
+```sh
+free
+logread | grep -E 'singbox-ui|sing-box' | tail -n 60
+nft list table inet sbui
+ip rule show
+ip -6 rule show
+```
+
+## Ограничения и статус
+
+Минимальное ядро с двумя HY2 и маршрутизацией по TLS SNI проверено на MT7621. Полная интеграция этого установщика с LuCI/procd и запуск после перезагрузки ещё требуют проверки на устройстве. GitHub workflow локально не запускался. Большие rule-set, QUIC-sniffing и длительная многопользовательская нагрузка на роутере не проверены.
+
+Параметры Go: начать с GOGC=100 и пустого GOMEMLIMIT. Последний является мягким ориентиром управляемой Go-памяти, не общим лимитом RSS и tmpfs.
+
+Лицензия upstream: GPL-3.0-or-later, см. [LICENSE](LICENSE) и [NOTICE.md](NOTICE.md).
+
+Документация: [sing-box](https://sing-box.sagernet.org/), [rule-set](https://sing-box.sagernet.org/configuration/rule-set/), [sniffing](https://sing-box.sagernet.org/configuration/route/sniff/).

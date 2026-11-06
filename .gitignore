@@ -1,0 +1,13 @@
+/dist/
+/.upstream/
+/core/toolchain/
+/core/source-inspect/
+/core/gopath/
+/core/gocache/
+/core/*.zip
+/core/sing-box-min-linux-mipsle*
+/core/*check.exe
+__pycache__/
+*.local.json
+*.log
+.env

@@ -1,0 +1,44 @@
+name: Build minimal sing-box and LuCI
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - name: Fetch pinned upstream
+        run: |
+          mkdir -p .upstream
+          curl --fail --location https://codeload.github.com/SagerNet/sing-box/tar.gz/refs/tags/v1.14.4 | tar -xz --strip-components=1 -C .upstream
+          mkdir -p .upstream/cmd/sing-box-min
+          cp core/minimal-main.go .upstream/cmd/sing-box-min/main.go
+      - name: Build MIPSLE and native check tool
+        run: |
+          mkdir -p dist
+          cd .upstream
+          CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build -trimpath -buildvcs=false -tags with_quic -ldflags '-s -w -buildid= -checklinkname=0' -o ../dist/sing-box-min-linux-mipsle ./cmd/sing-box-min
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -tags with_quic -ldflags '-s -w -buildid= -checklinkname=0' -o ../dist/check ./cmd/sing-box-min
+      - name: Validate and package
+        run: |
+          dist/check check -c examples/config.json
+          python3 scripts/package.py --binary dist/sing-box-min-linux-mipsle
+          python3 tests/validate.py
+          sh -n singbox-ui/install.sh
+          sh -n singbox-ui/root/usr/libexec/singbox-ui
+          sh -n singbox-ui/root/etc/init.d/singbox-ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-mipsle-singbox
+          path: |
+            dist/sing-box-min-linux-mipsle
+            dist/singbox-ui.tar.gz
+            dist/SHA256SUMS

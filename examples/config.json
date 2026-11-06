@@ -1,0 +1,85 @@
+{
+  "log": {
+    "level": "info",
+    "disabled": false
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "test",
+      "listen": "192.168.1.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "tproxy",
+      "tag": "transparent",
+      "listen": "::",
+      "listen_port": 2500
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy1",
+      "server": "203.0.113.10",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hy2",
+      "server": "203.0.113.20",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "vpn",
+      "outbounds": [
+        "hy1",
+        "hy2"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "1m"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "timeout": "1s"
+      },
+      {
+        "domain_suffix": [
+          "blocked.example"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_suffix": [
+          "api.ipify.org",
+          "vpn-only.example"
+        ],
+        "outbound": "vpn"
+      }
+    ],
+    "final": "direct"
+  }
+}

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Restore only this application's TPROXY table after firewall4 reloads.
+if [ -f /tmp/singbox-ui/pid ]; then
+ read -r pid < /tmp/singbox-ui/pid
+ if kill -0 "$pid" 2>/dev/null && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q '/tmp/sing-box'; then
+  /usr/libexec/singbox-ui routes-on
+ fi
+fi

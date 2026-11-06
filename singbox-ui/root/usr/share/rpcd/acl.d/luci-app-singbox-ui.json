@@ -1,0 +1,22 @@
+{
+ "luci-app-singbox-ui": {
+  "description":"Configure and control minimal sing-box",
+  "read": {
+   "uci":["singboxui"],
+   "ubus":{"file":["read","exec"]},
+   "file":{
+    "/usr/libexec/singbox-ui":["exec"],
+    "/etc/singbox-ui/config.json":["read"],
+    "/etc/singbox-ui/config.pending.json":["read"]
+   }
+  },
+  "write": {
+   "uci":["singboxui"],
+   "ubus":{"file":["write","exec"]},
+   "file":{
+    "/usr/libexec/singbox-ui":["exec"],
+    "/etc/singbox-ui/config.pending.json":["write"]
+   }
+  }
+ }
+}

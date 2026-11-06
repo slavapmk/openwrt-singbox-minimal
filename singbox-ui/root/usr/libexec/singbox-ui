@@ -1,0 +1,230 @@
+#!/bin/sh
+. /lib/functions.sh
+BASE=/etc/singbox-ui
+TMP=/tmp/singbox-ui
+BIN=/tmp/sing-box
+mkdir -p "$TMP/rules"
+chmod 700 "$TMP"
+fail() { echo "$*" >&2; logger -t singbox-ui "$*"; exit 1; }
+get_settings() {
+ config_load singboxui
+ config_get hash main sha256
+ config_get retry main retry 30
+ config_get delay main delay 0
+ config_get gogc main gogc 100
+ config_get gomemlimit main gomemlimit ''
+ config_get_bool transparent main transparent 0
+ config_get interface main interface br-lan
+ config_get port main port 2500
+ config_get_bool autostart main autostart 1
+ printf '%s\n' "$hash" | grep -Eq '^[a-fA-F0-9]{64}$' || fail 'Укажите SHA-256 бинарника: 64 символа'
+ for number in "$retry" "$delay" "$gogc" "$port"; do
+  printf '%s\n' "$number" | grep -Eq '^[0-9]{1,5}$' || fail 'Некорректный числовой параметр'
+ done
+ [ "$retry" -ge 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || fail 'Некорректный интервал или порт'
+ printf '%s\n' "$interface" | grep -Eq '^[a-zA-Z0-9_.:-]{1,15}$' || fail 'Некорректный интерфейс'
+ if [ -n "$gomemlimit" ]; then
+  printf '%s\n' "$gomemlimit" | grep -Eq '^[0-9]{1,4}MiB$' || fail 'GOMEMLIMIT: например 32MiB, либо пусто'
+ fi
+}
+valid_binary() {
+ [ -f "$BIN" ] && echo "$hash  $BIN" | sha256sum -c - >/dev/null 2>&1
+}
+download_binary() {
+ valid_binary && { chmod 700 "$BIN"; return 0; }
+ : > "$TMP/sources"
+ collect() { printf '%s\n' "$1" >> "$TMP/sources"; }
+ config_list_foreach main source collect
+ [ -s "$TMP/sources" ] || { echo 'Источники бинарника не заданы' >&2; return 1; }
+ # Called only before starting the core: never keep two ELF copies in RAM.
+ rm -f "$BIN" "$TMP/binary.part"
+ while IFS= read -r url; do
+  case "$url" in http://*|https://*) ;; *) echo 'Пропущен источник: нужен HTTP/HTTPS URL' >&2; continue;; esac
+  echo 'downloading' > "$TMP/state"
+  logger -t singbox-ui 'Downloading binary from next source'
+  wget -T 30 -O "$TMP/binary.part" "$url" &
+  downloader=$!
+  wait "$downloader"
+  result=$?
+  downloader=
+  if [ "$result" = 0 ] && echo "$hash  $TMP/binary.part" | sha256sum -c - >/dev/null 2>&1; then
+   mv "$TMP/binary.part" "$BIN"
+   chmod 700 "$BIN"
+   logger -t singbox-ui 'Binary SHA-256 OK'
+   return 0
+  fi
+  rm -f "$TMP/binary.part"
+  logger -t singbox-ui 'Source failed or SHA-256 mismatch; trying next'
+ done < "$TMP/sources"
+ return 1
+}
+asset() {
+ local section="$1" enabled name url checksum target
+ config_get_bool enabled "$section" enabled 1
+ [ "$enabled" = 1 ] || return 0
+ config_get name "$section" filename
+ config_get url "$section" url
+ config_get checksum "$section" sha256
+ printf '%s\n' "$name" | grep -Eq '^[a-zA-Z0-9_-]+\.(srs|json)$' || fail 'Имя списка: name.srs или name.json'
+ target="$TMP/rules/$name"
+ [ "$force_assets" = 1 ] || [ ! -f "$target" ] || return 0
+ case "$url" in http://*|https://*) ;; *) fail 'Для списка нужен HTTP/HTTPS URL';; esac
+ if [ -n "$checksum" ]; then
+  printf '%s\n' "$checksum" | grep -Eq '^[a-fA-F0-9]{64}$' || fail 'Некорректный SHA-256 списка'
+ fi
+ if ! wget -T 30 -O "$target.part" "$url"; then
+  rm -f "$target.part"
+  [ ! -f "$target" ] || return 0
+  fail "Не удалось загрузить список $name"
+ fi
+ [ "$(wc -c < "$target.part")" -le 2097152 ] || { rm -f "$target.part"; fail 'Список превышает лимит 2 МиБ'; }
+ if [ -n "$checksum" ]; then
+  echo "$checksum  $target.part" | sha256sum -c - >/dev/null 2>&1 || { rm -f "$target.part"; fail "SHA-256 списка $name не совпал"; }
+ fi
+ mv "$target.part" "$target"
+}
+assets() { force_assets="$1"; config_foreach asset ruleset; }
+routes_off() {
+ nft delete table inet sbui 2>/dev/null
+ ip rule del pref 101 fwmark 0x200/0xffffffff lookup 101 2>/dev/null
+ ip -6 rule del pref 101 fwmark 0x200/0xffffffff lookup 101 2>/dev/null
+ ip route del local default dev lo table 101 2>/dev/null
+ ip -6 route del local default dev lo table 101 2>/dev/null
+ return 0
+}
+routes_on() {
+ [ "$transparent" = 1 ] || { routes_off; return; }
+ jsonfilter -i "$BASE/config.json" -e '@.inbounds[*].type' | grep -qx tproxy || fail 'В JSON нет входа tproxy'
+ jsonfilter -i "$BASE/config.json" -e '@.inbounds[*].listen_port' | grep -qx "$port" || fail 'Порт TPROXY не найден в JSON'
+ {
+  if nft list table inet sbui >/dev/null 2>&1; then echo 'delete table inet sbui'; fi
+  cat <<EOF
+table inet sbui {
+ chain prerouting {
+  type filter hook prerouting priority -151; policy accept;
+  iifname != "$interface" return
+  ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } return
+  ip6 daddr != 2000::/3 return
+  meta l4proto { tcp, udp } th dport { 53, 853 } return
+  meta nfproto ipv4 meta l4proto { tcp, udp } counter meta mark set 0x200 tproxy ip to 127.0.0.1:$port accept
+  meta nfproto ipv6 meta l4proto { tcp, udp } counter meta mark set 0x200 tproxy ip6 to [::1]:$port accept
+ }
+}
+EOF
+ } > "$TMP/routes.nft"
+ nft -c -f "$TMP/routes.nft" || fail 'Ошибка правил перехвата'
+ ip route replace local default dev lo table 101 || exit 1
+ ip -6 route replace local default dev lo table 101 || exit 1
+ ip rule show | grep -Eq '^101:.*fwmark 0x200(/0xffffffff)?.*lookup 101' || ip rule add pref 101 fwmark 0x200/0xffffffff lookup 101 || exit 1
+ ip -6 rule show | grep -Eq '^101:.*fwmark 0x200(/0xffffffff)?.*lookup 101' || ip -6 rule add pref 101 fwmark 0x200/0xffffffff lookup 101 || exit 1
+ nft -f "$TMP/routes.nft" || exit 1
+}
+check_config() {
+ [ -x "$BIN" ] || fail 'Бинарник ещё не загружен. Сначала запустите службу.'
+ "$BIN" check -c "$1"
+}
+status() {
+ . /usr/share/libubox/jshn.sh
+ local running=0 pid state='stopped' version=''
+ if [ -f "$TMP/pid" ]; then
+  read -r pid < "$TMP/pid"
+  if kill -0 "$pid" 2>/dev/null && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q '/tmp/sing-box'; then running=1; fi
+ fi
+ [ ! -f "$TMP/state" ] || read -r state < "$TMP/state"
+ if [ "$running" = 1 ]; then state=running; elif [ "$state" = running ]; then state=stopped; fi
+ [ ! -x "$BIN" ] || version=$("$BIN" version 2>/dev/null)
+ json_init
+ json_add_boolean running "$running"
+ json_add_string state "$state"
+ json_add_string version "$version"
+ json_add_string ram "$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)"
+ json_add_string log "$(logread | grep -E 'singbox-ui|sing-box' | tail -n 60)"
+ json_dump
+}
+case "$1" in
+ status) status;;
+ routes-off) routes_off;;
+ routes-on) get_settings; routes_on;;
+ check) check_config "$BASE/config.pending.json";;
+ apply)
+  get_settings
+  if [ -f "$BASE/config.pending.json" ] && [ ! -x "$BIN" ]; then
+   if [ "$autostart" = 1 ]; then /etc/init.d/singbox-ui enable; else /etc/init.d/singbox-ui disable; fi
+   (/etc/init.d/singbox-ui restart) > "$TMP/service.log" 2>&1 < /dev/null &
+   echo 'Настройки сохранены. JSON будет проверен после загрузки бинарника, до запуска.'
+   exit 0
+  fi
+  assets 0
+  if [ -f "$BASE/config.pending.json" ]; then
+   check_config "$BASE/config.pending.json" || fail 'JSON не прошёл проверку; рабочий конфиг не изменён'
+   cp -p "$BASE/config.json" "$BASE/config.previous.json"
+   mv "$BASE/config.pending.json" "$BASE/config.json"
+   chmod 600 "$BASE/config.json" "$BASE/config.previous.json"
+  fi
+  if [ "$autostart" = 1 ]; then /etc/init.d/singbox-ui enable; else /etc/init.d/singbox-ui disable; fi
+  (
+   /etc/init.d/singbox-ui restart
+   sleep $((delay + 15))
+   pid=
+   [ ! -f "$TMP/pid" ] || read -r pid < "$TMP/pid"
+   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    if [ -f "$BASE/config.previous.json" ]; then
+     logger -t singbox-ui 'New configuration did not stay running; restoring previous JSON'
+     cp -p "$BASE/config.previous.json" "$BASE/config.json"
+     /etc/init.d/singbox-ui restart
+    fi
+   fi
+  ) > "$TMP/service.log" 2>&1 < /dev/null &
+  echo 'Применено. Служба перезапускается.'
+ ;;
+ rollback)
+  [ -f "$BASE/config.previous.json" ] || fail 'Предыдущего конфига пока нет'
+  check_config "$BASE/config.previous.json" || exit 1
+  cp -p "$BASE/config.previous.json" "$BASE/config.json"
+  (/etc/init.d/singbox-ui restart) > "$TMP/service.log" 2>&1 < /dev/null &
+  echo 'Предыдущий конфиг восстановлен'
+ ;;
+ start|stop|restart)
+  action="$1"
+  (/etc/init.d/singbox-ui "$action") > "$TMP/service.log" 2>&1 < /dev/null &
+  echo 'Команда отправлена'
+ ;;
+ assets)
+  get_settings
+  assets 1
+  echo 'Списки загружены'
+ ;;
+ run)
+  get_settings
+  downloader=
+  trap 'if [ -n "$downloader" ]; then kill "$downloader" 2>/dev/null; wait "$downloader" 2>/dev/null; fi; echo stopped > "$TMP/state"; exit 0' INT TERM
+  sleep "$delay"
+  while ! download_binary; do
+   echo waiting > "$TMP/state"
+   logger -t singbox-ui "Waiting $retry seconds before download retry"
+   sleep "$retry"
+  done
+  assets 0
+  if [ -f "$BASE/config.pending.json" ]; then
+   if check_config "$BASE/config.pending.json"; then
+    cp -p "$BASE/config.json" "$BASE/config.previous.json"
+    mv "$BASE/config.pending.json" "$BASE/config.json"
+    chmod 600 "$BASE/config.json" "$BASE/config.previous.json"
+   else logger -t singbox-ui 'Pending JSON rejected; keeping active configuration'; fi
+  fi
+  if ! check_config "$BASE/config.json"; then
+   if [ -f "$BASE/config.previous.json" ] && check_config "$BASE/config.previous.json"; then
+    cp -p "$BASE/config.previous.json" "$BASE/config.json"
+    logger -t singbox-ui 'Restored previous valid JSON'
+   else fail 'Рабочий JSON не прошёл проверку'; fi
+  fi
+  routes_on
+  export GOGC="$gogc"
+  if [ -n "$gomemlimit" ]; then export GOMEMLIMIT="$gomemlimit"; else unset GOMEMLIMIT; fi
+  echo $$ > "$TMP/pid"
+  echo running > "$TMP/state"
+  logger -t singbox-ui 'Starting core'
+  exec "$BIN" run -c "$BASE/config.json"
+ ;;
+ *) fail 'Unknown action';;
+esac
