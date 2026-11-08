@@ -24,3 +24,14 @@ if (repo/'dist/singbox-ui.tar.gz').exists():
         assert tar.getmember('singbox-ui/root/etc/singbox-ui/config.json').mode==0o600
         assert tar.getmember('singbox-ui/root/usr/libexec/singbox-ui').mode==0o755
 print('PASS: example rules, public credentials, JSON, package hash and permissions')
+
+update=repo/'dist/singbox-ui-update.tar.gz'
+if update.exists():
+    with tarfile.open(update) as tar:
+        names=tar.getnames()
+        assert 'singbox-ui-update/update.sh' in names
+        assert not any('/root/etc/config/' in n or '/root/etc/singbox-ui/' in n for n in names)
+        assert not any(n.endswith('/sing-box') for n in names)
+        import subprocess
+        subprocess.run(['sh', '-n'], input=tar.extractfile('singbox-ui-update/update.sh').read(), check=True)
+    print('PASS: UI update excludes user settings and core; updater shell syntax')

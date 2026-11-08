@@ -71,7 +71,11 @@ return view.extend({
    try {var c=JSON.parse(value); return c && !Array.isArray(c) && typeof c==='object' ? true : 'Ожидается JSON-объект';}
    catch(e) {return e.message;}
   };
-  o.write=function(section,value) {return fs.write('/etc/singbox-ui/config.pending.json',value+'\n',384);};
+  o.write=function(section,value) {
+   if (value.trim() === data[1].trim())
+    return fs.write('/etc/singbox-ui/config.pending.json',data[1],384);
+   return fs.write('/etc/singbox-ui/config.pending.json',value+'\n',384);
+  };
   this.editor=o;
   var tools=s.taboption('json',form.DummyValue,'json_tools','Файлы и проверка');
   tools.renderWidget=function(section) {
@@ -89,7 +93,7 @@ return view.extend({
    }},'Скачать JSON');
    var check=E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function() {
     try {JSON.parse(value());}catch(e){notify(true,e.message);return;}
-    return fs.write('/etc/singbox-ui/config.pending.json',value()+'\n',384)
+    return fs.write('/etc/singbox-ui/config.check.json',value()+'\n',384)
      .then(function(){return execute('check');}).then(function(){notify(false,'Проверка sing-box пройдена');}).catch(function(e){notify(true,e.message);});
    })},'Проверить JSON');
    return E('div',{},[input,save,check,actionButton('Предыдущий рабочий JSON','rollback')]);

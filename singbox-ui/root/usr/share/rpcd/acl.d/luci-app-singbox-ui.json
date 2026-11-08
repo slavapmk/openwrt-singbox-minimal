@@ -15,7 +15,8 @@
    "ubus":{"file":["write","exec"]},
    "file":{
     "/usr/libexec/singbox-ui":["exec"],
-    "/etc/singbox-ui/config.pending.json":["write"]
+    "/etc/singbox-ui/config.pending.json":["write"],
+    "/etc/singbox-ui/config.check.json":["write"]
    }
   }
  }

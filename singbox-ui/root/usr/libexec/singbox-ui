@@ -93,17 +93,44 @@ routes_off() {
  ip -6 route del local default dev lo table 101 2>/dev/null
  return 0
 }
-routes_on() {
+# Only inputs which require restarting the core. Routing/autostart changes
+# are applied live; binary sources and rule sets are included in the snapshot.
+core_signature() {
+ {
+  uci export singboxui | awk '
+   /^config / { main = ($2 == "main") }
+   main && $1 == "option" && $2 ~ /^(transparent|interface|port|autostart)$/ { next }
+   { print }'
+  cat "$BASE/config.json"
+ } | sha256sum
+}
+core_running() {
+ local pid
+ [ -f "$TMP/pid" ] || return 1
+ read -r pid < "$TMP/pid"
+ case "$pid" in ''|*[!0-9]*) return 1;; esac
+ [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null &&
+  tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q '^/tmp/sing-box run '
+}
+validate_tproxy() {
+ # Select the port from the SAME inbound as its type.
+ jsonfilter -i "$1" -e '@.inbounds[@.type="tproxy"].listen_port' |
+  grep -qx "$port" || fail 'В JSON нет входа tproxy с указанным портом'
+}
+routes_on() (
  [ "$transparent" = 1 ] || { routes_off; return; }
- jsonfilter -i "$BASE/config.json" -e '@.inbounds[*].type' | grep -qx tproxy || fail 'В JSON нет входа tproxy'
- jsonfilter -i "$BASE/config.json" -e '@.inbounds[*].listen_port' | grep -qx "$port" || fail 'Порт TPROXY не найден в JSON'
+ validate_tproxy "$BASE/config.json"
+ routes_file=$(mktemp "$TMP/routes.XXXXXX") || exit 1
+ trap 'rm -f "$routes_file"' EXIT
  {
   if nft list table inet sbui >/dev/null 2>&1; then echo 'delete table inet sbui'; fi
   cat <<EOF
 table inet sbui {
  chain prerouting {
   type filter hook prerouting priority -151; policy accept;
+  ct status dnat ct direction reply counter return comment "bypass-dnat-replies"
   iifname != "$interface" return
+  fib daddr type local return
   ip daddr { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 } return
   ip6 daddr != 2000::/3 return
   meta l4proto { tcp, udp } th dport { 53, 853 } return
@@ -112,25 +139,22 @@ table inet sbui {
  }
 }
 EOF
- } > "$TMP/routes.nft"
- nft -c -f "$TMP/routes.nft" || fail 'Ошибка правил перехвата'
+ } > "$routes_file"
+ nft -c -f "$routes_file" || fail 'Ошибка правил перехвата'
  ip route replace local default dev lo table 101 || exit 1
  ip -6 route replace local default dev lo table 101 || exit 1
  ip rule show | grep -Eq '^101:.*fwmark 0x200(/0xffffffff)?.*lookup 101' || ip rule add pref 101 fwmark 0x200/0xffffffff lookup 101 || exit 1
  ip -6 rule show | grep -Eq '^101:.*fwmark 0x200(/0xffffffff)?.*lookup 101' || ip -6 rule add pref 101 fwmark 0x200/0xffffffff lookup 101 || exit 1
- nft -f "$TMP/routes.nft" || exit 1
-}
+ nft -f "$routes_file" || exit 1
+)
 check_config() {
  [ -x "$BIN" ] || fail 'Бинарник ещё не загружен. Сначала запустите службу.'
  "$BIN" check -c "$1"
 }
 status() {
  . /usr/share/libubox/jshn.sh
- local running=0 pid state='stopped' version=''
- if [ -f "$TMP/pid" ]; then
-  read -r pid < "$TMP/pid"
-  if kill -0 "$pid" 2>/dev/null && tr '\000' ' ' < "/proc/$pid/cmdline" | grep -q '/tmp/sing-box'; then running=1; fi
- fi
+ local running=0 state='stopped' version=''
+ if core_running; then running=1; fi
  [ ! -f "$TMP/state" ] || read -r state < "$TMP/state"
  if [ "$running" = 1 ]; then state=running; elif [ "$state" = running ]; then state=stopped; fi
  [ ! -x "$BIN" ] || version=$("$BIN" version 2>/dev/null)
@@ -169,7 +193,7 @@ case "$1" in
  ;;
  routes-off) routes_off;;
  routes-on) get_settings; routes_on;;
- check) check_config "$BASE/config.pending.json";;
+ check) check_config "$BASE/config.check.json";;
  apply)
   get_settings
   if [ -f "$BASE/config.pending.json" ] && [ ! -x "$BIN" ]; then
@@ -178,27 +202,29 @@ case "$1" in
    echo 'Настройки сохранены. JSON будет проверен после загрузки бинарника, до запуска.'
    exit 0
   fi
+  if [ -f "$BASE/config.pending.json" ]; then
+   if cmp -s "$BASE/config.pending.json" "$BASE/config.json"; then
+    rm -f "$BASE/config.pending.json"
+   fi
+  fi
   assets 0
   if [ -f "$BASE/config.pending.json" ]; then
    check_config "$BASE/config.pending.json" || fail 'JSON не прошёл проверку; рабочий конфиг не изменён'
+   [ "$transparent" != 1 ] || validate_tproxy "$BASE/config.pending.json"
    cp -p "$BASE/config.json" "$BASE/config.previous.json"
    mv "$BASE/config.pending.json" "$BASE/config.json"
    chmod 600 "$BASE/config.json" "$BASE/config.previous.json"
   fi
   if [ "$autostart" = 1 ]; then /etc/init.d/singbox-ui enable; else /etc/init.d/singbox-ui disable; fi
-  (
-   /etc/init.d/singbox-ui restart
-   sleep $((delay + 15))
-   pid=
-   [ ! -f "$TMP/pid" ] || read -r pid < "$TMP/pid"
-   if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    if [ -f "$BASE/config.previous.json" ]; then
-     logger -t singbox-ui 'New configuration did not stay running; restoring previous JSON'
-     cp -p "$BASE/config.previous.json" "$BASE/config.json"
-     /etc/init.d/singbox-ui restart
-    fi
-   fi
-  ) > "$TMP/service.log" 2>&1 < /dev/null &
+  if core_running && [ -f "$TMP/core.signature" ] &&
+   [ "$(core_signature)" = "$(cat "$TMP/core.signature")" ]; then
+   routes_on || exit 1
+   echo 'Применено без перезапуска ядра.'
+   exit 0
+  fi
+  # No delayed rollback worker: it could overwrite a later successful apply
+  # or revert JSON while a slow download is still in progress.
+  (/etc/init.d/singbox-ui restart) > "$TMP/service.log" 2>&1 < /dev/null &
   echo 'Применено. Служба перезапускается.'
  ;;
  rollback)
@@ -247,7 +273,8 @@ case "$1" in
     logger -t singbox-ui 'Restored previous valid JSON'
    else fail 'Рабочий JSON не прошёл проверку'; fi
   fi
-  routes_on
+  routes_on || exit 1
+  core_signature > "$TMP/core.signature"
   export GOGC="$gogc"
   if [ -n "$gomemlimit" ]; then export GOMEMLIMIT="$gomemlimit"; else unset GOMEMLIMIT; fi
   echo $$ > "$TMP/pid"

@@ -31,7 +31,9 @@ jobs:
         run: |
           dist/check check -c examples/config.json
           python3 scripts/package.py --binary dist/sing-box-min-linux-mipsle
+          python3 scripts/package-ui-update.py
           python3 tests/validate.py
+          python3 tests/routing.py
           sh -n singbox-ui/install.sh
           sh -n singbox-ui/root/usr/libexec/singbox-ui
           sh -n singbox-ui/root/etc/init.d/singbox-ui
@@ -41,4 +43,5 @@ jobs:
           path: |
             dist/sing-box-min-linux-mipsle
             dist/singbox-ui.tar.gz
+            dist/singbox-ui-update.tar.gz
             dist/SHA256SUMS
