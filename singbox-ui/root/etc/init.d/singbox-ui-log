@@ -1,0 +1,12 @@
+#!/bin/sh /etc/rc.common
+START=98
+STOP=10
+USE_PROCD=1
+start_service() {
+ mkdir -p /tmp/singbox-ui
+ chmod 700 /tmp/singbox-ui
+ procd_open_instance
+ procd_set_param command /sbin/logread -f -e 'sing.*box' -F /tmp/singbox-ui/app.log -S 64
+ procd_set_param respawn 3600 2 5
+ procd_close_instance
+}

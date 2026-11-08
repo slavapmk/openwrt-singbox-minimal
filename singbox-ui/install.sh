@@ -23,7 +23,7 @@ for file in etc/config/dhcp etc/config/firewall usr/share/luci/menu.d/luci-app-h
  [ ! -f "/$file" ] || echo "$file" >> "$backup/existing"
 done
 tar -czf "$backup/previous.tar.gz" -C / -T "$backup/existing"
-for name in hy-vpn hyroute singbox-ui; do
+for name in hy-vpn hyroute singbox-ui singbox-ui-log; do
  if [ -x "/etc/init.d/$name" ] && "/etc/init.d/$name" enabled; then touch "$backup/enabled-$name"; fi
 done
 for name in hy_route sb_sni_test sbui; do
@@ -41,6 +41,8 @@ cat > "$backup/rollback.sh" <<'EOF'
 #!/bin/sh
 cd "$(dirname "$0")" || exit 1
 /etc/init.d/singbox-ui stop 2>/dev/null
+/etc/init.d/singbox-ui-log stop 2>/dev/null
+/etc/init.d/singbox-ui-log disable 2>/dev/null
 /etc/init.d/singbox-ui disable 2>/dev/null
 while IFS= read -r file; do rm -f "/$file"; done < manifest
 tar -xzf previous.tar.gz -C /
@@ -58,7 +60,7 @@ for family in 4 6; do
   fi
  done
 done
-for name in hy-vpn hyroute singbox-ui; do
+for name in hy-vpn hyroute singbox-ui singbox-ui-log; do
  [ ! -f "enabled-$name" ] || "/etc/init.d/$name" enable
 done
 rm -f /tmp/luci-indexcache
@@ -84,7 +86,7 @@ elif [ -f /tmp/router-test.json ]; then
 fi
 chmod 700 /etc/singbox-ui
 chmod 600 /etc/config/singboxui /etc/singbox-ui/config.json
-chmod 755 /usr/libexec/singbox-ui /usr/libexec/singbox-ui-firewall /etc/init.d/singbox-ui
+chmod 755 /usr/libexec/singbox-ui /usr/libexec/singbox-ui-firewall /etc/init.d/singbox-ui /etc/init.d/singbox-ui-log
 
 if [ -x /tmp/sing-box ] && ! /tmp/sing-box check -c /etc/singbox-ui/config.json; then
  exit 1
@@ -125,6 +127,8 @@ rm -f /usr/share/luci/menu.d/luci-app-hyroute.json /tmp/luci-indexcache
 /etc/init.d/dnsmasq restart
 /etc/init.d/rpcd restart
 if [ "$(uci -q get singboxui.main.autostart)" = 1 ]; then /etc/init.d/singbox-ui enable; fi
+/etc/init.d/singbox-ui-log enable
+/etc/init.d/singbox-ui-log restart
 /etc/init.d/singbox-ui start
 trap - EXIT
 echo 'Готово: Сеть → Sing-box. Настройте источники бинарника перед перезагрузкой.'

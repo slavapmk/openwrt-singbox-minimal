@@ -130,5 +130,131 @@ set -- check
 ''' + DISPATCH)
         self.assertFalse((self.path / 'config.pending.json').exists())
 
+    def startup(self, current='valid', pending=None):
+        (self.path / 'config.json').write_text(current)
+        (self.path / 'config.previous.json').write_text('previous')
+        if pending is not None:
+            (self.path / 'config.pending.json').write_text(pending)
+        core = self.path / 'core'
+        core.write_text('#!/bin/sh\necho started\n')
+        core.chmod(0o700)
+        return self.run_shell('''
+get_settings() { delay=0; }
+download_binary() { return 0; }
+assets() { return 0; }
+check_config() { ! grep -q INVALID "$1"; }
+validate_tproxy() { return 0; }
+routes_on() { return 0; }
+set -- run
+''' + DISPATCH, ok=False if 'INVALID' in (pending if pending is not None else current) else True)
+
+    def test_invalid_active_json_never_rolls_back(self):
+        self.startup(current='INVALID')
+        self.assertEqual((self.path / 'config.json').read_text(), 'INVALID')
+        self.assertEqual((self.path / 'config.previous.json').read_text(), 'previous')
+        self.assertFalse((self.path / 'files.lock').exists())
+
+    def test_invalid_pending_json_never_runs_old_config(self):
+        r = self.startup(pending='INVALID')
+        self.assertNotIn('started', r.stdout)
+        self.assertEqual((self.path / 'config.pending.json').read_text(), 'INVALID')
+        self.assertEqual((self.path / 'config.json').read_text(), 'valid')
+
+    def test_valid_saved_json_is_applied_on_start(self):
+        r = self.startup(pending='new')
+        self.assertIn('started', r.stdout)
+        self.assertEqual((self.path / 'config.json').read_text(), 'new')
+        self.assertEqual((self.path / 'config.previous.json').read_text(), 'valid')
+        self.assertFalse((self.path / 'files.lock').exists())
+
+    def test_file_lock_rejects_second_writer(self):
+        r = self.run_shell('acquire_files; acquire_files; rc=$?; release_files; exit "$rc"', ok=False)
+        self.assertIn('уже выполняется', r.stderr)
+        self.assertFalse((self.path / 'files.lock').exists())
+
+    def test_delete_bin_only_removes_ram_copy(self):
+        (self.path / 'core').write_text('ELF')
+        self.run_shell('''
+require_stopped() { return 0; }
+config_load() { :; }
+acquire_files
+set -- files-job remove-bin ''
+''' + DISPATCH)
+        self.assertFalse((self.path / 'core').exists())
+        self.assertTrue((self.path / 'config.json').exists())
+        self.assertEqual((self.path / 'files.state').read_text().strip(), 'done')
+        self.assertFalse((self.path / 'files.lock').exists())
+
+    def test_running_service_blocks_manual_file_changes(self):
+        (self.path / 'core').write_text('ELF')
+        self.run_shell('''
+require_stopped() { return 1; }
+acquire_files
+set -- files-job remove-bin ''
+''' + DISPATCH, ok=False)
+        self.assertEqual((self.path / 'core').read_text(), 'ELF')
+        self.assertFalse((self.path / 'files.lock').exists())
+
+    def test_private_logs_do_not_replay_syslog_after_clear(self):
+        (self.path / 'app.log.old').write_text('older\n')
+        (self.path / 'app.log').write_text('recent\n')
+        self.assertEqual(self.run_shell('read_logs').stdout, 'older\nrecent\n')
+        (self.path / 'app.log.old').unlink()
+        (self.path / 'app.log').write_text('')
+        self.assertEqual(self.run_shell('read_logs').stdout, '')
+        (self.path / 'app.log').write_text('new event\n')
+        self.assertEqual(self.run_shell('read_logs').stdout, 'new event\n')
+
+    def test_failed_geo_refresh_reports_error_and_keeps_existing_file(self):
+        (self.path / 'rules').mkdir()
+        (self.path / 'rules/test.srs').write_text('existing')
+        self.run_shell('''
+config_get_bool() { eval "$1=1"; }
+config_get() {
+ case "$3" in filename) eval "$1=test.srs";; url) eval "$1=https://example.test/test.srs";; sha256) eval "$1=''";; esac
+}
+wget() { return 1; }
+force_assets=1
+asset geo
+''', ok=False)
+        self.assertEqual((self.path / 'rules/test.srs').read_text(), 'existing')
+        self.assertFalse((self.path / 'rules/test.srs.part').exists())
+
+    def test_bin_wrong_hash_is_rejected(self):
+        (self.path / 'rules').mkdir()
+        self.run_shell('''
+hash=0000000000000000000000000000000000000000000000000000000000000000
+config_list_foreach() { collect https://example.test/bin; }
+wget() { echo bad > "$5"; }
+download_binary
+''', ok=False)
+        self.assertFalse((self.path / 'core').exists())
+        self.assertFalse((self.path / 'binary.part').exists())
+
+    def test_cached_bin_is_verified_without_fetching(self):
+        (self.path / 'core').write_text('cached')
+        self.run_shell('''
+hash=$(sha256sum "$BIN" | cut -d ' ' -f1)
+wget() { echo unexpected >&2; return 1; }
+download_binary
+''')
+        self.assertTrue(os.access(self.path / 'core', os.X_OK))
+
+    def test_geo_url_change_refreshes_cached_file(self):
+        (self.path / 'rules').mkdir()
+        self.run_shell('''
+config_get_bool() { eval "$1=1"; }
+config_get() {
+ case "$3" in filename) eval "$1=test.srs";; url) eval "$1=$source_url";; sha256) eval "$1=''";; esac
+}
+wget() { echo "$6" > "$5"; }
+force_assets=0
+source_url=https://example.test/old
+asset geo
+source_url=https://example.test/new
+asset geo
+''')
+        self.assertEqual((self.path / 'rules/test.srs').read_text().strip(), 'https://example.test/new')
+
 if __name__ == '__main__':
     unittest.main()

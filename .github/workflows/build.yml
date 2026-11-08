@@ -34,6 +34,7 @@ jobs:
           python3 scripts/package-ui-update.py
           python3 tests/validate.py
           python3 tests/routing.py
+          node tests/ui.js
           sh -n singbox-ui/install.sh
           sh -n singbox-ui/root/usr/libexec/singbox-ui
           sh -n singbox-ui/root/etc/init.d/singbox-ui

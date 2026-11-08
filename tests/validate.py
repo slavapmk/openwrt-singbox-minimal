@@ -30,6 +30,7 @@ if update.exists():
     with tarfile.open(update) as tar:
         names=tar.getnames()
         assert 'singbox-ui-update/update.sh' in names
+        assert tar.getmember('singbox-ui-update/root/etc/init.d/singbox-ui-log').mode == 0o755
         assert not any('/root/etc/config/' in n or '/root/etc/singbox-ui/' in n for n in names)
         assert not any(n.endswith('/sing-box') for n in names)
         import subprocess

@@ -9,8 +9,8 @@
 
 var commit = rpc.declare({object:'uci', method:'commit', params:['config']});
 var helper = '/usr/libexec/singbox-ui';
-function execute(action) {
- return fs.exec(helper, [action]).then(function(r) {
+function execute(action, args) {
+ return fs.exec(helper, [action].concat(args || [])).then(function(r) {
   if (r.code !== 0) throw new Error(r.stderr || r.stdout || 'Ошибка команды');
   return r.stdout || '';
  });
@@ -18,23 +18,37 @@ function execute(action) {
 function notify(error, text) {
  ui.addNotification(null, E('p', {}, text), error ? 'danger' : 'info');
 }
-function actionButton(label, action) {
+function actionButton(label, action, args, after) {
  return E('button', {'type':'button', 'class':'cbi-button cbi-button-action', 'click':ui.createHandlerFn(null, function() {
-  return execute(action).then(function(s) {notify(false,s);}).catch(function(e) {notify(true,e.message);});
+  return execute(action,args).then(function(s) {notify(false,s);return after ? after() : null;}).catch(function(e) {notify(true,e.message);});
  })}, label);
 }
 return view.extend({
  load: function() {
-  return Promise.all([uci.load('singboxui'), fs.read('/etc/singbox-ui/config.json')]);
+  return Promise.all([uci.load('singboxui'), fs.read('/etc/singbox-ui/config.json'),
+   fs.read('/etc/singbox-ui/config.pending.json').catch(function(){return null;})]);
  },
  render: function(data) {
   var self=this;
+  var editorText=data[2] != null ? data[2] : data[1];
   var m=new form.Map('singboxui','Sing-box',
    'Минимальная сборка HY2/SNI. Бинарник и списки — в RAM; настройки и JSON — в постоянной памяти.');
   this.map=m;
   var status=E('div', {'class':'cbi-section'}, 'Проверка состояния…');
   var logs=E('textarea', {'readonly':'', 'rows':12, 'style':'width:100%;font-family:monospace'}, '');
   var logGeneration=0;
+  var binStatus=E('p',{},'Проверка Bin…');
+  var fileStatus=E('p',{},'');
+  var inventory=E('pre',{},'Geo-файлов в RAM пока нет');
+  var fileRows={};
+  function bytes(value) {return (Number(value || 0)/1048576).toFixed(2)+' МиБ';}
+  function reloadEditor() {
+   return fs.read('/etc/singbox-ui/config.json').then(function(text) {
+    data[1]=text;
+    var editor=self.editor.getUIElement('main');
+    if(editor) {editor.setValue(text);editor.triggerValidation();}
+   });
+  }
   function update() {
    var generation=logGeneration;
    return execute('status').then(function(text) {
@@ -42,14 +56,26 @@ return view.extend({
     var states={running:'работает',stopped:'остановлен',downloading:'скачивается бинарник',waiting:'ожидание повторной загрузки',preparing:'подготовка запуска',loading_rules:'загрузка списков',checking:'проверка конфигурации',error:'ошибка запуска'};
     status.textContent=(s.running ? 'Работает' : (states[s.state] || s.state)) +
      ' · RAM: '+(Number(s.ram)/1024).toFixed(1)+' МиБ · '+(s.version || 'бинарник не загружен') + (s.error ? ' · '+s.error : '');
-    if(generation===logGeneration) logs.value=s.log || 'Журнал пока пуст';
+    if(generation===logGeneration) logs.value=s.log || '';
+    binStatus.textContent=s.binary_present ? '/tmp/sing-box · '+bytes(s.binary_size)+' · '+(s.version || 'не исполняется') : 'Bin отсутствует в RAM';
+    var operations={startup:'подготовка файлов для запуска','download-bin':'скачивание Bin','remove-bin':'удаление Bin',assets:'скачивание Geo Files','remove-assets':'удаление Geo Files','download-asset':'скачивание Geo-файла','remove-asset':'удаление Geo-файла',done:'завершено',failed:'ошибка'};
+    fileStatus.textContent='Файлы: '+(operations[s.files_state] || s.files_state || 'операций пока нет')+(s.files_busy ? ' · выполняется' : '')+(s.files_error ? ' · '+s.files_error : '');
+    var files=s.files || [];
+    inventory.textContent=files.length ? files.map(function(f){return f.name+' · '+bytes(f.size);}).join('\n') : 'Geo-файлов в RAM пока нет';
+    Object.keys(fileRows).forEach(function(section) {
+     var name=uci.get('singboxui',section,'filename');
+     var file=files.filter(function(f){return f.name===name;})[0];
+     fileRows[section].textContent=file ? bytes(file.size)+' в RAM' : 'Нет в RAM';
+    });
    }).catch(function(e) {status.textContent='Ошибка состояния: '+e.message;});
   }
   var s=m.section(form.NamedSection,'main','main');
-  s.tab('core','Бинарник');
+  s.tab('core','Bin');
+  s.tab('geo','Geo Files');
   s.tab('json','Конфигурация JSON');
-  s.tab('start','Запуск');
+  s.tab('start','Настройки запуска');
   s.tab('routing','Перехват LAN');
+  s.tab('logs','Логи');
   var o=s.taboption('core',form.DynamicList,'source','Источники по порядку',
    'Прямые HTTP/HTTPS-ссылки на распакованный ELF-файл MIPSLE. Сначала NAS, затем GitHub raw или release asset. ZIP/GZIP не поддерживаются.');
   o.validate=function(section,value) {
@@ -58,15 +84,19 @@ return view.extend({
   o=s.taboption('core',form.Value,'sha256','SHA-256 бинарника');
   o.rmempty=false;
   o.validate=function(section,value) {return /^[a-f0-9]{64}$/i.test(value || '') ? true : '64 шестнадцатеричных символа';};
+  o=s.taboption('core',form.DummyValue,'binary_files','Bin в RAM');
+  o.renderWidget=function() {return E('div',{},[binStatus,
+   actionButton('Удалить Bin из RAM','remove-bin',[],update),
+   E('p',{},'«Скачать Bin» загружает файл по сохранённым URL и проверяет SHA-256. Для замены или удаления сначала остановите службу. «Запустить» автоматически проверяет Bin и загружает недостающие Geo-файлы.')]);};
   o=s.taboption('core',form.DummyValue,'binaryinfo','Загрузка');
   o.rawhtml=false;
   o.cfgvalue=function() {return 'После перезагрузки файл скачивается заново. При обычном перезапуске проверенная копия в /tmp используется повторно. При ошибке источника пробуем следующий; при ошибке SHA-256 файл отклоняется.';};
 
-  o=s.taboption('json',form.TextValue,'editor','Рабочая конфигурация',
-   'Это единственный источник настроек серверов и маршрутов. Интерфейс не генерирует и не переписывает содержимое JSON.');
+  o=s.taboption('json',form.TextValue,'editor','Конфигурация JSON',
+   '«Сохранить» сохраняет JSON для следующего запуска. «Сохранить и применить» проверяет и применяет его. Автоматического отката нет: ошибка остаётся видимой.');
   o.rows=28; o.monospace=true; o.rmempty=false; o.forcewrite=true;
-  o.load=function() {return data[1];};
-  o.cfgvalue=function() {return data[1];};
+  o.load=function() {return editorText;};
+  o.cfgvalue=function() {return editorText;};
   o.validate=function(section,value) {
    try {var c=JSON.parse(value); return c && !Array.isArray(c) && typeof c==='object' ? true : 'Ожидается JSON-объект';}
    catch(e) {return e.message;}
@@ -96,7 +126,7 @@ return view.extend({
     return fs.write('/etc/singbox-ui/config.check.json',value()+'\n',384)
      .then(function(){return execute('check');}).then(function(){notify(false,'Проверка sing-box пройдена');}).catch(function(e){notify(true,e.message);});
    })},'Проверить JSON');
-   return E('div',{},[input,save,check,actionButton('Предыдущий рабочий JSON','rollback')]);
+   return E('div',{},[input,save,check,actionButton('Восстановить предыдущий JSON','rollback',[],function(){return reloadEditor().then(update);}),E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function(){return reloadEditor().catch(function(e){notify(true,e.message);});})},'Прочитать JSON с роутера')]);
   };
 
   o=s.taboption('start',form.Flag,'autostart','Автозапуск');o.rmempty=false;
@@ -113,37 +143,56 @@ return view.extend({
   o=s.taboption('routing',form.DummyValue,'routing_note','Поведение');
   o.cfgvalue=function(){return 'Перехватываются TCP/UDP устройств LAN. Действие VPN/напрямую/блокировка определяется JSON. До первого запуска ядра перехват не включён. Остановка службы отключает перехват; при аварии процесса правила остаются до его перезапуска. ECH может скрывать имя.';};
 
-  s=m.section(form.GridSection,'ruleset','Файлы правил',
-   'Небольшие SRS/JSON-файлы из HTTP/HTTPS. Загружаются перед запуском; кнопка ниже обновляет их вручную. В JSON указывайте local rule-set с path /tmp/singbox-ui/rules/ИМЯ. Лимит одного файла — 2 МиБ; суммарный расход RAM зависит от списков.');
-  s.anonymous=true;s.addremove=true;
-  o=s.option(form.Flag,'enabled','Включён');o.default='1';o.rmempty=false;
-  o=s.option(form.Value,'filename','Имя файла');o.placeholder='geosite-small.srs';o.rmempty=false;
+  o=s.taboption('geo',form.DummyValue,'geo_actions','Управление файлами');
+  o.renderWidget=function(){return E('div',{},[
+   actionButton('Скачать Geo Files','assets',[],update),
+   actionButton('Удалить Geo Files из RAM','remove-assets',[],update),inventory]);};
+  var geoSection=s.taboption('geo',form.SectionValue,'geo_files',form.GridSection,'ruleset','Geo Files',
+   'Небольшие SRS/JSON-файлы из HTTP/HTTPS. Загружаются перед запуском; можно скачать и удалить вручную без запуска ядра. Операции используют сохранённые настройки. В JSON указывайте local rule-set с path /tmp/singbox-ui/rules/ИМЯ. Лимит одного файла — 2 МиБ; суммарный расход RAM зависит от списков.');
+  var g=geoSection.subsection;
+  g.anonymous=true;g.addremove=true;
+  o=g.option(form.Flag,'enabled','Включён');o.default='1';o.rmempty=false;
+  o=g.option(form.Value,'filename','Имя файла');o.placeholder='geosite-small.srs';o.rmempty=false;
   o.validate=function(section,v){return /^[a-z0-9_-]+\.(srs|json)$/i.test(v || '') ? true : 'Имя вида name.srs или name.json';};
-  o=s.option(form.Value,'url','URL');o.rmempty=false;
+  o=g.option(form.Value,'url','URL');o.rmempty=false;
   o.validate=function(section,v){return /^https?:\/\/[^\s]+$/i.test(v || '') ? true : 'Нужна HTTP/HTTPS-ссылка';};
-  o=s.option(form.Value,'sha256','SHA-256 списка (необязательно)');
+  o=g.option(form.Value,'sha256','SHA-256 списка (необязательно)');
   o.validate=function(section,v){return !v || /^[a-f0-9]{64}$/i.test(v) ? true : '64 шестнадцатеричных символа';};
+
+  o=g.option(form.DummyValue,'file_actions','Файл в RAM');
+  o.renderWidget=function(section) {
+   var info=E('span',{},'Проверка…');fileRows[section]=info;
+   return E('div',{},[info,E('br'),
+    actionButton('Скачать','download-asset',[section],update),
+    actionButton('Удалить из RAM','remove-asset',[section],update)]);
+  };
+  o=s.taboption('logs',form.DummyValue,'app_logs','Журнал приложения');
+  o.renderWidget=function(){return E('div',{},[
+   E('p',{},'Журнал хранится в RAM: до двух файлов по 64 КиБ. Ниже — весь сохранённый журнал и вывод последней операции с файлами. Очистка удаляет записи журнала приложения; новые сообщения продолжают поступать.'),
+   E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function() {
+    logGeneration++;
+    return execute('clear-log').then(function(text){logGeneration++;logs.value='';notify(false,text);return update();})
+     .catch(function(e){notify(true,e.message);});
+   })},'Очистить журнал'),
+   E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,update)},'Обновить'),logs]);};
 
   return m.render().then(function(node) {
    poll.add(update,10);update();
    return E('div',{},[status,E('div',{'class':'cbi-section'},[
-    actionButton('Запустить','start'),actionButton('Остановить','stop'),actionButton('Перезапустить','restart')]),
-    node,E('div',{'class':'cbi-section'},[actionButton('Загрузить сохранённые списки','assets')]),
-    E('h3',{},'Журнал'),
-    E('p',{},'Последние 60 записей из кольцевого журнала OpenWrt в RAM. Уровень задаётся в JSON: log.level (warn, error, info, debug); log.disabled: true отключает журнал ядра.'),
-    E('button',{'type':'button','class':'cbi-button','click':ui.createHandlerFn(null,function() {
-     logGeneration++;
-     return execute('clear-log').then(function(text){logGeneration++;logs.value='';notify(false,text);return update();})
-      .catch(function(e){notify(true,e.message);});
-    })},'Очистить окно журнала'),logs]);
+    actionButton('Скачать Bin','download-bin',[],update),
+    actionButton('Запустить','start',[],update),actionButton('Остановить','stop',[],update),actionButton('Перезапустить','restart',[],update)]),fileStatus,node]);
   });
  },
- handleSave:null,
+ handleSave:function() {
+  return this.map.save().then(function(){return commit('singboxui');})
+   .then(function(){notify(false,'Настройки сохранены без запуска службы. JSON сохранён для следующего запуска.');})
+   .catch(function(e){notify(true,e.message);});
+ },
  handleSaveApply:function() {
   return this.map.save().then(function(){return commit('singboxui');})
    .then(function(){return execute('apply');})
    .then(function(text){notify(false,text);window.location.reload();})
    .catch(function(e){notify(true,e.message);});
  },
- handleReset:function(){notify(false,'Несохранённые изменения формы сброшены. Для журнала используйте «Очистить окно журнала».');return this.map.reset();}
+ handleReset:function(){notify(false,'Несохранённые изменения формы сброшены. Для журнала используйте «Очистить журнал» во вкладке «Логи».');return this.map.reset();}
 });

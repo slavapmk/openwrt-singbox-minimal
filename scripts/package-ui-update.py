@@ -14,11 +14,17 @@ cd "$(dirname "$0")"
  echo 'Existing singbox-ui installation required; use install.sh for a clean install.' >&2
  exit 1
 }
+if [ \"$(cat /tmp/singbox-ui/files.lock/kind 2>/dev/null)\" = manual ]; then
+ echo 'Wait for the manual file operation to finish before updating.' >&2
+ exit 1
+fi
 find root/usr/libexec root/etc/init.d -type f | while IFS= read -r file; do sh -n "$file"; done
 cp -R root/* /
-chmod 755 /usr/libexec/singbox-ui* /etc/init.d/singbox-ui
+chmod 755 /usr/libexec/singbox-ui* /etc/init.d/singbox-ui /etc/init.d/singbox-ui-log
 rm -f /tmp/luci-indexcache
 rm -rf /tmp/luci-modulecache
+/etc/init.d/singbox-ui-log enable
+/etc/init.d/singbox-ui-log restart
 /etc/init.d/singbox-ui restart
 /etc/init.d/rpcd restart
 echo 'UI updated; core restarting. Reload the LuCI page.'

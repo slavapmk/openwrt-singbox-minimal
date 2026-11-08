@@ -27,11 +27,78 @@ get_settings() {
   printf '%s\n' "$gomemlimit" | grep -Eq '^[0-9]{1,4}MiB$' || fail 'GOMEMLIMIT: например 32MiB, либо пусто'
  fi
 }
+# One writer for downloads/deletion/startup. Recover only a dead recorded owner.
+acquire_files() {
+ if ! mkdir "$TMP/files.lock" 2>/dev/null; then
+  owner=
+  read -r owner < "$TMP/files.lock/pid" 2>/dev/null || true
+  case "$owner" in ''|*[!0-9]*) echo 'Операция с файлами уже выполняется' >&2; return 1;; esac
+  if kill -0 "$owner" 2>/dev/null; then echo 'Операция с файлами уже выполняется' >&2; return 1; fi
+  rm -f "$TMP/files.lock/pid" "$TMP/files.lock/kind"
+  rmdir "$TMP/files.lock" 2>/dev/null || return 1
+  mkdir "$TMP/files.lock" 2>/dev/null || return 1
+ fi
+ echo $$ > "$TMP/files.lock/pid"
+ files_locked=1
+}
+release_files() {
+ [ "${files_locked:-0}" = 1 ] || return 0
+ rm -f "$TMP/files.lock/pid" "$TMP/files.lock/kind"
+ rmdir "$TMP/files.lock" 2>/dev/null || true
+ files_locked=0
+}
+require_stopped() {
+ local pid cmd
+ if [ -f "$TMP/pid" ]; then
+  read -r pid < "$TMP/pid"
+  case "$pid" in ''|*[!0-9]*) pid=0;; esac
+  if [ "$pid" -gt 1 ] && kill -0 "$pid" 2>/dev/null; then
+   cmd=$(tr '\000' ' ' < "/proc/$pid/cmdline")
+   case "$cmd" in *'/usr/libexec/singbox-ui run'*|'/tmp/sing-box run '*)
+    echo 'Сначала остановите службу: файлы используются ядром или его запуском' >&2; return 1;;
+   esac
+  fi
+ fi
+ return 0
+}
+valid_asset_name() { printf '%s\n' "$1" | grep -Eq '^[a-zA-Z0-9_-]+\.(srs|json)$'; }
+check_asset_section() {
+ printf '%s\n' "$1" | grep -Eq '^[a-zA-Z0-9_]+$' || fail 'Некорректный идентификатор Geo-файла'
+ [ "$(uci -q get "singboxui.$1")" = ruleset ] || fail 'Geo-файл не найден в сохранённых настройках'
+}
+queue_files() {
+ require_stopped || return 1
+ acquire_files || return 1
+ echo manual > "$TMP/files.lock/kind"
+ rm -f "$TMP/files.error"
+ echo "$1" > "$TMP/files.state"
+ # File operations run independently of the RPC timeout; poll status for results.
+ : > "$TMP/operations.log"
+ (/usr/libexec/singbox-ui files-job "$1" "$2") >> "$TMP/operations.log" 2>&1 < /dev/null &
+ echo $! > "$TMP/files.lock/pid"
+ echo 'Операция запущена. Результат появится в состоянии файлов и журнале.'
+}
+read_logs() {
+ cat "$TMP/app.log.old" "$TMP/app.log" 2>/dev/null |
+  sed 's/\x1b\[[0-9;]*m//g'
+ if [ -s "$TMP/operations.log" ]; then
+  printf '\n--- Операция с файлами ---\n'
+  tail -n 40 "$TMP/operations.log"
+ fi
+}
+fetch_file() {
+ wget -q -T 30 -O "$1" "$2" &
+ downloader=$!
+ wait "$downloader"
+ result=$?
+ downloader=
+ return "$result"
+}
 valid_binary() {
  [ -f "$BIN" ] && echo "$hash  $BIN" | sha256sum -c - >/dev/null 2>&1
 }
 download_binary() {
- valid_binary && { chmod 700 "$BIN"; return 0; }
+ valid_binary && { chmod 700 "$BIN"; logger -t singbox-ui 'Cached Bin SHA-256 OK'; return 0; }
  : > "$TMP/sources"
  collect() { printf '%s\n' "$1" >> "$TMP/sources"; }
  config_list_foreach main source collect
@@ -42,11 +109,8 @@ download_binary() {
   case "$url" in http://*|https://*) ;; *) echo 'Пропущен источник: нужен HTTP/HTTPS URL' >&2; continue;; esac
   echo 'downloading' > "$TMP/state"
   logger -t singbox-ui 'Downloading binary from next source'
-  wget -T 30 -O "$TMP/binary.part" "$url" &
-  downloader=$!
-  wait "$downloader"
+  fetch_file "$TMP/binary.part" "$url"
   result=$?
-  downloader=
   if [ "$result" = 0 ] && echo "$hash  $TMP/binary.part" | sha256sum -c - >/dev/null 2>&1; then
    mv "$TMP/binary.part" "$BIN"
    chmod 700 "$BIN"
@@ -60,22 +124,27 @@ download_binary() {
  return 1
 }
 asset() {
- local section="$1" enabled name url checksum target
+ local section="$1" enabled name url checksum target signature
  config_get_bool enabled "$section" enabled 1
- [ "$enabled" = 1 ] || return 0
+ [ "$enabled" = 1 ] || [ "${single_asset:-0}" = 1 ] || return 0
  config_get name "$section" filename
  config_get url "$section" url
  config_get checksum "$section" sha256
  printf '%s\n' "$name" | grep -Eq '^[a-zA-Z0-9_-]+\.(srs|json)$' || fail 'Имя списка: name.srs или name.json'
  target="$TMP/rules/$name"
- [ "$force_assets" = 1 ] || [ ! -f "$target" ] || return 0
  case "$url" in http://*|https://*) ;; *) fail 'Для списка нужен HTTP/HTTPS URL';; esac
  if [ -n "$checksum" ]; then
   printf '%s\n' "$checksum" | grep -Eq '^[a-fA-F0-9]{64}$' || fail 'Некорректный SHA-256 списка'
  fi
- if ! wget -T 30 -O "$target.part" "$url"; then
+ mkdir -p "$TMP/asset-state"
+ signature=$(printf '%s\n%s\n' "$url" "$checksum" | sha256sum)
+ if [ "$force_assets" != 1 ] && [ -f "$target" ] &&
+  [ "$(cat "$TMP/asset-state/$name" 2>/dev/null)" = "$signature" ] &&
+  [ "$(wc -c < "$target")" -le 2097152 ]; then
+  if [ -z "$checksum" ] || echo "$checksum  $target" | sha256sum -c - >/dev/null 2>&1; then return 0; fi
+ fi
+ if ! fetch_file "$target.part" "$url"; then
   rm -f "$target.part"
-  [ ! -f "$target" ] || return 0
   fail "Не удалось загрузить список $name"
  fi
  [ "$(wc -c < "$target.part")" -le 2097152 ] || { rm -f "$target.part"; fail 'Список превышает лимит 2 МиБ'; }
@@ -83,6 +152,8 @@ asset() {
   echo "$checksum  $target.part" | sha256sum -c - >/dev/null 2>&1 || { rm -f "$target.part"; fail "SHA-256 списка $name не совпал"; }
  fi
  mv "$target.part" "$target"
+ printf '%s\n' "$signature" > "$TMP/asset-state/$name"
+ logger -t singbox-ui "Geo file ready: $name"
 }
 assets() { force_assets="$1"; config_foreach asset ruleset; }
 routes_off() {
@@ -153,7 +224,7 @@ check_config() {
 }
 status() {
  . /usr/share/libubox/jshn.sh
- local running=0 state='stopped' version=''
+ local running=0 binary_size=0 state='stopped' version=''
  if core_running; then running=1; fi
  [ ! -f "$TMP/state" ] || read -r state < "$TMP/state"
  if [ "$running" = 1 ]; then state=running; elif [ "$state" = running ]; then state=stopped; fi
@@ -164,37 +235,69 @@ status() {
  json_add_string error "$(cat "$TMP/error" 2>/dev/null)"
  json_add_string version "$version"
  json_add_string ram "$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo)"
- # The marker lives in RAM like logd's ring buffer. If it has rotated out,
- # all remaining records are newer and may be displayed.
- json_add_string log "$(logread | awk -v marker="$(cat "$TMP/log-marker" 2>/dev/null)" '
-  /singbox-ui|sing-box/ {
-   if (marker != "" && index($0, marker)) { count=0; next }
-   line=$0; gsub(sprintf("%c",27) "\\[[0-9;]*m", "", line)
-   lines[++count]=line
-  }
-  END { start=count-59; if(start<1)start=1; for(i=start;i<=count;i++)print lines[i] }
- ')"
+ json_add_string log "$(read_logs)"
+ json_add_string files_state "$(cat "$TMP/files.state" 2>/dev/null)"
+ json_add_string files_error "$(cat "$TMP/files.error" 2>/dev/null)"
+ json_add_boolean files_busy "$([ ! -d "$TMP/files.lock" ]; echo $?)"
+ json_add_boolean binary_present "$([ ! -f "$BIN" ]; echo $?)"
+ [ ! -f "$BIN" ] || binary_size=$(wc -c < "$BIN")
+ json_add_string binary_size "$binary_size"
+ json_add_array files
+ for file in "$TMP"/rules/*; do
+  [ -f "$file" ] || continue
+  case "$file" in *.srs|*.json) ;; *) continue;; esac
+  json_add_object ''
+  json_add_string name "${file##*/}"
+  json_add_string size "$(wc -c < "$file")"
+  json_close_object
+ done
+ json_close_array
  json_dump
 }
 case "$1" in
  status) status;;
  clear-log)
-  marker="SBUI_LOG_CLEAR_$(date +%s)_$$"
-  logger -t singbox-ui "$marker"
-  # logger sends asynchronously: wait until logd exposes the boundary.
-  tries=0
-  while ! logread | grep -Fq "$marker"; do
-   tries=$((tries + 1))
-   [ "$tries" -lt 4 ] || { echo 'Не удалось установить границу журнала' >&2; exit 1; }
-   sleep 1
-  done
-  printf '%s\n' "$marker" > "$TMP/log-marker"
-  echo 'Старые записи скрыты. Новые события будут появляться в журнале.'
+  /etc/init.d/singbox-ui-log stop || exit 1
+  : > "$TMP/app.log"
+  : > "$TMP/operations.log"
+  rm -f "$TMP/app.log.old" "$TMP/log-marker"
+  /etc/init.d/singbox-ui-log start || exit 1
+  echo 'Журнал приложения очищен'
+ ;;
+ download-bin|remove-bin|assets|remove-assets|download-asset|remove-asset)
+  queue_files "$1" "${2:-}"
+ ;;
+ files-job)
+  files_locked=1
+  trap 'rc=$?; if [ "$rc" != 0 ]; then echo failed > "$TMP/files.state"; tail -n 10 "$TMP/operations.log" > "$TMP/files.error"; else echo stopped > "$TMP/state"; rm -f "$TMP/error"; fi; release_files' EXIT
+  downloader=
+  trap 'if [ -n "$downloader" ]; then kill "$downloader" 2>/dev/null; wait "$downloader" 2>/dev/null; fi; exit 1' INT TERM
+  echo $$ > "$TMP/files.lock/pid"
+  require_stopped || exit 1
+  config_load singboxui
+  case "$2" in download-bin|assets|download-asset) get_settings;; esac
+  case "$2" in
+   download-bin) rm -f "$BIN"; download_binary || fail 'Не удалось скачать Bin: см. журнал';;
+   remove-bin) rm -f "$BIN" "$TMP/binary.part";;
+   assets) assets 1;;
+   remove-assets) rm -f "$TMP"/rules/* "$TMP"/asset-state/*;;
+   download-asset) check_asset_section "$3"; force_assets=1; single_asset=1; asset "$3";;
+   remove-asset)
+    check_asset_section "$3"
+    config_get name "$3" filename
+    valid_asset_name "$name" || fail 'Некорректное имя Geo-файла'
+    rm -f "$TMP/rules/$name" "$TMP/rules/$name.part" "$TMP/asset-state/$name"
+   ;;
+   *) fail 'Unknown file action';;
+  esac
+  echo done > "$TMP/files.state"
+  logger -t singbox-ui "File operation completed: $2"
  ;;
  routes-off) routes_off;;
  routes-on) get_settings; routes_on;;
  check) check_config "$BASE/config.check.json";;
  apply)
+  [ "$(cat "$TMP/files.lock/kind" 2>/dev/null)" != manual ] || { echo 'Дождитесь завершения операции с файлами' >&2; exit 1; }
   get_settings
   if [ -f "$BASE/config.pending.json" ] && [ ! -x "$BIN" ]; then
    if [ "$autostart" = 1 ]; then /etc/init.d/singbox-ui enable; else /etc/init.d/singbox-ui disable; fi
@@ -207,7 +310,6 @@ case "$1" in
     rm -f "$BASE/config.pending.json"
    fi
   fi
-  assets 0
   if [ -f "$BASE/config.pending.json" ]; then
    check_config "$BASE/config.pending.json" || fail 'JSON не прошёл проверку; рабочий конфиг не изменён'
    [ "$transparent" != 1 ] || validate_tproxy "$BASE/config.pending.json"
@@ -228,29 +330,35 @@ case "$1" in
   echo 'Применено. Служба перезапускается.'
  ;;
  rollback)
+  [ "$(cat "$TMP/files.lock/kind" 2>/dev/null)" != manual ] || { echo 'Дождитесь завершения операции с файлами' >&2; exit 1; }
   [ -f "$BASE/config.previous.json" ] || fail 'Предыдущего конфига пока нет'
   check_config "$BASE/config.previous.json" || exit 1
   cp -p "$BASE/config.previous.json" "$BASE/config.json"
+  rm -f "$BASE/config.pending.json" "$BASE/config.check.json"
   (/etc/init.d/singbox-ui restart) > "$TMP/service.log" 2>&1 < /dev/null &
   echo 'Предыдущий конфиг восстановлен'
  ;;
  start|stop|restart)
+  if [ "$1" != stop ] && [ "$(cat "$TMP/files.lock/kind" 2>/dev/null)" = manual ]; then
+   echo 'Дождитесь завершения операции с файлами' >&2
+   exit 1
+  fi
   action="$1"
   (/etc/init.d/singbox-ui "$action") > "$TMP/service.log" 2>&1 < /dev/null &
   echo 'Команда отправлена'
  ;;
- assets)
-  get_settings
-  assets 1
-  echo 'Списки загружены'
- ;;
  run)
+  acquire_files || exit 1
+  echo startup > "$TMP/files.lock/kind"
+  echo $$ > "$TMP/pid"
+  echo startup > "$TMP/files.state"
+  rm -f "$TMP/files.error"
   echo preparing > "$TMP/state"
   rm -f "$TMP/error"
-  trap 'rc=$?; if [ "$rc" != 0 ]; then echo error > "$TMP/state"; fi' EXIT
+  trap 'rc=$?; release_files; if [ "$rc" != 0 ]; then echo error > "$TMP/state"; fi' EXIT
   get_settings
   downloader=
-  trap 'if [ -n "$downloader" ]; then kill "$downloader" 2>/dev/null; wait "$downloader" 2>/dev/null; fi; echo stopped > "$TMP/state"; exit 0' INT TERM
+  trap 'if [ -n "$downloader" ]; then kill "$downloader" 2>/dev/null; wait "$downloader" 2>/dev/null; fi; release_files; echo stopped > "$TMP/state"; exit 0' INT TERM
   sleep "$delay"
   while ! download_binary; do
    echo waiting > "$TMP/state"
@@ -261,18 +369,17 @@ case "$1" in
   assets 0
   echo checking > "$TMP/state"
   if [ -f "$BASE/config.pending.json" ]; then
-   if check_config "$BASE/config.pending.json"; then
+   check_config "$BASE/config.pending.json" || fail 'Сохранённый JSON не прошёл проверку; запуск отменён'
+   [ "$transparent" != 1 ] || validate_tproxy "$BASE/config.pending.json"
+   if ! cmp -s "$BASE/config.pending.json" "$BASE/config.json"; then
     cp -p "$BASE/config.json" "$BASE/config.previous.json"
     mv "$BASE/config.pending.json" "$BASE/config.json"
     chmod 600 "$BASE/config.json" "$BASE/config.previous.json"
-   else logger -t singbox-ui 'Pending JSON rejected; keeping active configuration'; fi
+   else rm -f "$BASE/config.pending.json"; fi
   fi
-  if ! check_config "$BASE/config.json"; then
-   if [ -f "$BASE/config.previous.json" ] && check_config "$BASE/config.previous.json"; then
-    cp -p "$BASE/config.previous.json" "$BASE/config.json"
-    logger -t singbox-ui 'Restored previous valid JSON'
-   else fail 'Рабочий JSON не прошёл проверку'; fi
-  fi
+  check_config "$BASE/config.json" || fail 'Рабочий JSON не прошёл проверку; запуск отменён. Откат доступен только вручную.'
+  release_files
+  echo done > "$TMP/files.state"
   routes_on || exit 1
   core_signature > "$TMP/core.signature"
   export GOGC="$gogc"
