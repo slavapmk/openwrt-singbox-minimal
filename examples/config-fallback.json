@@ -1,0 +1,153 @@
+{
+  "log": {
+    "level": "info",
+    "disabled": false
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "test",
+      "listen": "192.168.1.1",
+      "listen_port": 1080
+    },
+    {
+      "type": "tproxy",
+      "tag": "transparent",
+      "listen": "::",
+      "listen_port": 2500
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "hysteria2",
+      "tag": "spmk1",
+      "server": "203.0.113.10",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "spmk2",
+      "server": "203.0.113.11",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "fin1",
+      "server": "203.0.113.12",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "fin2",
+      "server": "203.0.113.13",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "fin3",
+      "server": "203.0.113.14",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "fin4",
+      "server": "203.0.113.15",
+      "server_port": 20001,
+      "password": "CHANGE_ME",
+      "tls": {
+        "enabled": true,
+        "server_name": "vpn.example.com"
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "spmk",
+      "outbounds": [
+        "spmk1",
+        "spmk2"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "30s"
+    },
+    {
+      "type": "urltest",
+      "tag": "fin",
+      "outbounds": [
+        "fin1",
+        "fin2",
+        "fin3",
+        "fin4"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "30s"
+    },
+    {
+      "type": "fallback",
+      "tag": "vpn",
+      "outbounds": [
+        "spmk",
+        "fin"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "30s",
+      "recovery_checks": 2,
+      "interrupt_exist_connections": false
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "action": "sniff",
+        "sniffer": [
+          "tls",
+          "http",
+          "quic"
+        ],
+        "timeout": "1s"
+      },
+      {
+        "domain_suffix": [
+          "blocked.example"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_suffix": [
+          "api.ipify.org",
+          "vpn-only.example"
+        ],
+        "outbound": "vpn"
+      }
+    ],
+    "final": "direct"
+  }
+}

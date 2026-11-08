@@ -20,7 +20,9 @@ jobs:
           mkdir -p .upstream
           curl --fail --location https://codeload.github.com/SagerNet/sing-box/tar.gz/refs/tags/v1.14.4 | tar -xz --strip-components=1 -C .upstream
           mkdir -p .upstream/cmd/sing-box-min
-          cp core/minimal-main.go .upstream/cmd/sing-box-min/main.go
+          python3 scripts/prepare-core.py
+      - name: Test fallback priority and recovery
+        run: go -C .upstream test -race -tags with_quic ./cmd/sing-box-min
       - name: Build MIPSLE and native check tool
         run: |
           mkdir -p dist
@@ -30,6 +32,7 @@ jobs:
       - name: Validate and package
         run: |
           dist/check check -c examples/config.json
+          dist/check check -c examples/config-fallback.json
           python3 scripts/package.py --binary dist/sing-box-min-linux-mipsle
           python3 scripts/package-ui-update.py
           python3 tests/validate.py

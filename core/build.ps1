@@ -13,6 +13,7 @@ if (-not (Test-Path 'source-inspect/sing-box-1.14.4/go.mod')) {
 $sourceDir = 'source-inspect/sing-box-1.14.4'
 New-Item -ItemType Directory -Force "$sourceDir/cmd/sing-box-min" | Out-Null
 Copy-Item 'minimal-main.go' "$sourceDir/cmd/sing-box-min/main.go"
+Copy-Item 'fallback.go' "$sourceDir/cmd/sing-box-min/fallback.go"
 $env:GOPATH = "$PSScriptRoot/gopath"
 $env:GOCACHE = "$PSScriptRoot/gocache"
 $env:GOTOOLCHAIN = 'local'
